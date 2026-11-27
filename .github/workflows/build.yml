@@ -119,15 +119,21 @@ jobs:
         with:
           path: build
 
+      # checkout@v4 only resolves branches and tags, not bare commit SHAs, so
+      # the branch is fetched and then reset to the pinned commit.
       - name: Checkout SFA
         uses: actions/checkout@v4
         with:
           repository: SagerNet/sing-box-for-android
-          ref: ${{ env.SFA_REF }}
+          ref: main
           path: sfa
-          # fetch-depth: 1 fails when SFA_REF is a full SHA that is not the
-          # branch tip, which is exactly how the pinned base is referenced.
           fetch-depth: 0
+
+      - name: Pin SFA to ${{ env.SFA_REF }}
+        working-directory: sfa
+        run: |
+          git checkout --force $SFA_REF
+          git log --oneline -1
 
       - name: Download libbox
         uses: actions/download-artifact@v4
