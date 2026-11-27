@@ -59,13 +59,15 @@ jobs:
           distribution: temurin
           java-version: ${{ env.JAVA_VERSION }}
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
+      # The runner image already ships an Android SDK at ANDROID_SDK_ROOT.
+      # Do not use android-actions/setup-android here: it tries to install the
+      # legacy "tools" package, which no longer exists, and fails the job.
       - name: Install NDK
         run: |
-          yes | sdkmanager --licenses > /dev/null 2>&1 || true
-          sdkmanager "ndk;27.2.12479018" > /dev/null
+          echo "SDK: $ANDROID_SDK_ROOT"
+          ls $ANDROID_SDK_ROOT
+          yes | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null 2>&1 || true
+          $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager "ndk;27.2.12479018" > /dev/null
           echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.2.12479018" >> "$GITHUB_ENV"
 
       - name: Install gomobile
@@ -124,13 +126,11 @@ jobs:
           distribution: temurin
           java-version: ${{ env.JAVA_VERSION }}
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
       - name: Install SDK packages
         run: |
-          yes | sdkmanager --licenses > /dev/null 2>&1 || true
-          sdkmanager "platforms;android-36" "build-tools;36.0.0" > /dev/null
+          SDKM=$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager
+          yes | $SDKM --licenses > /dev/null 2>&1 || true
+          $SDKM "platforms;android-36" "build-tools;36.0.0" > /dev/null
 
       - name: Apply China customisations
         run: bash "$GITHUB_WORKSPACE/scripts/apply-patches.sh" "$GITHUB_WORKSPACE/sfa"
