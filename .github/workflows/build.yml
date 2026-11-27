@@ -8,6 +8,10 @@
 # 32-bit targets), while the Gradle stage is a few minutes. Splitting them
 # keeps a Gradle failure from throwing away a finished libbox build.
 
+# The default GITHUB_TOKEN is read-only; creating a release needs write.
+permissions:
+  contents: write
+
 on:
   push:
     branches: [main]
