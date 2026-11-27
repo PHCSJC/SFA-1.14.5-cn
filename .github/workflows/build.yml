@@ -39,6 +39,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
+      # This repo is only checked out for scripts/, hence the separate path.
+      - name: Checkout build scripts
+        uses: actions/checkout@v4
+        with:
+          path: build
+
       - name: Checkout sing-box
         uses: actions/checkout@v4
         with:
@@ -85,7 +91,7 @@ jobs:
           # with_naive_outbound, whose cronet static libs fail to link with
           # the runner's lld. See scripts/build-libbox.sh for the details.
           cd sing-box
-          bash "$GITHUB_WORKSPACE/scripts/build-libbox.sh" "$SING_BOX_REF"
+          bash "$GITHUB_WORKSPACE/build/scripts/build-libbox.sh" "$SING_BOX_REF"
 
       - name: Show artefacts
         run: |
@@ -107,6 +113,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
+      # This repo supplies scripts/ and overlay/; the SFA tree is separate.
+      - name: Checkout build scripts
+        uses: actions/checkout@v4
+        with:
+          path: build
+
       - name: Checkout SFA
         uses: actions/checkout@v4
         with:
@@ -137,7 +149,7 @@ jobs:
           $SDKM "platforms;android-36" "build-tools;36.0.0" > /dev/null
 
       - name: Apply China customisations
-        run: bash "$GITHUB_WORKSPACE/scripts/apply-patches.sh" "$GITHUB_WORKSPACE/sfa"
+        run: bash "$GITHUB_WORKSPACE/build/scripts/apply-patches.sh" "$GITHUB_WORKSPACE/sfa"
 
       - name: Gradle cache
         uses: actions/cache@v4
