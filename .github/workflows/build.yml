@@ -1,4 +1,4 @@
-name: Build SFA-1.14.5-cn
+﻿name: Build SFA-1.14.5-cn
 
 # Builds sing-box's libbox for Android from a pinned upstream tag, drops the
 # resulting AARs into the SFA tree, then assembles a debug-signed APK.
@@ -125,7 +125,9 @@ jobs:
           repository: SagerNet/sing-box-for-android
           ref: ${{ env.SFA_REF }}
           path: sfa
-          fetch-depth: 1
+          # fetch-depth: 1 fails when SFA_REF is a full SHA that is not the
+          # branch tip, which is exactly how the pinned base is referenced.
+          fetch-depth: 0
 
       - name: Download libbox
         uses: actions/download-artifact@v4
