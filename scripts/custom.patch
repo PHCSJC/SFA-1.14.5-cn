@@ -1,0 +1,408 @@
+diff --git a/app/src/main/java/io/nekohasekai/sfa/bg/BoxService.kt b/app/src/main/java/io/nekohasekai/sfa/bg/BoxService.kt
+index e63e4bf..928ea5c 100644
+--- a/app/src/main/java/io/nekohasekai/sfa/bg/BoxService.kt
++++ b/app/src/main/java/io/nekohasekai/sfa/bg/BoxService.kt
+@@ -34,6 +34,8 @@ import io.nekohasekai.sfa.constant.Alert
+ import io.nekohasekai.sfa.constant.Status
+ import io.nekohasekai.sfa.database.ProfileManager
+ import io.nekohasekai.sfa.database.Settings
++import io.nekohasekai.sfa.geoip.GeoIPProfileInjector
++import io.nekohasekai.sfa.geoip.GeoIPRuleSet
+ import io.nekohasekai.sfa.ktx.hasPermission
+ import io.nekohasekai.sfa.vendor.Vendor
+ import kotlinx.coroutines.CoroutineScope
+@@ -48,6 +50,29 @@ import kotlinx.coroutines.runBlocking
+ import kotlinx.coroutines.withContext
+ import java.io.File
+ 
++/**
++ * Why the app must always exclude itself from the VPN
++ * ---------------------------------------------------
++ * With `auto_route`, sing-tun installs `ip rule ... fwmark 0x0/0x20000 lookup tun0`,
++ * which sends every unmarked packet from every uid into the tun device. That
++ * includes sing-box's own outbound sockets, because the core runs inside this
++ * app's process and therefore carries this app's uid.
++ *
++ * The result is a routing loop: a `direct` outbound dials 123.129.x.x, the
++ * kernel routes that packet back into tun0, the core receives its own
++ * connection, routes it again, and so on. While the proxy is reachable the loop
++ * eventually drains through the proxy so it looks merely slow; once the proxy
++ * is dead the packet has nowhere to go and domestic sites stop working
++ * entirely - which is exactly the bug this comment prevents.
++ *
++ * The loop only exists when the core is not excluded from the VPN. `exclude_package`
++ * turns into `VpnService.Builder.addDisallowedApplication()`, so the app's own
++ * sockets bypass the tun device and reach the network directly.
++ *
++ * Upstream SFA only sets that list in per-app-proxy mode, so with the default
++ * settings the app was inside its own VPN. Adding the self-exclusion on the
++ * non-per-app path closes the loop without changing what the user sees.
++ */
+ class BoxService(private val service: Service, private val platformInterface: PlatformInterface) : CommandServerHandler {
+     companion object {
+         private const val PROFILE_UPDATE_INTERVAL = 15L * 60 * 1000 // 15 minutes in milliseconds
+@@ -118,6 +143,53 @@ class BoxService(private val service: Service, private val platformInterface: Pl
+ 
+     private var lastProfileName = ""
+ 
++    /**
++     * Ensures the bundled China-IP rule-set exists, then rewrites the profile
++     * so `geoip-cn` points at that local file.
++     *
++     * Keeping this out of the profile itself means the data can be refreshed
++     * without touching the user's configuration, and a missing or corrupt
++     * rule-set can never make sing-box abort after the tun device is up.
++     */
++    /**
++     * Refreshes the China-IP rule-set in the background when the configured
++     * interval has elapsed.
++     *
++     * The service is already running on the current data, so a failed download
++     * is harmless: it is recorded for the settings screen and the next start
++     * retries. We deliberately do not restart the service afterwards, because
++     * swapping the rule-set under a live core is the same class of problem as
++     * switching profiles at runtime.
++     */
++    private fun scheduleRuleSetUpdate() {
++        if (!GeoIPRuleSet.isUpdateDue()) return
++        GlobalScope.launch(Dispatchers.IO) {
++            val result = GeoIPRuleSet.update()
++            if (result.isFailure) {
++                Log.w(TAG, "geoip rule-set update failed: ${result.exceptionOrNull()?.message}")
++            } else {
++                Log.i(TAG, "geoip rule-set updated: ${result.getOrNull()} bytes")
++            }
++        }
++    }
++
++    private suspend fun prepareContent(rawContent: String): String {
++        val ruleSetFile = try {
++            GeoIPRuleSet.ensureInstalled()
++        } catch (e: Exception) {
++            Log.w(TAG, "geoip rule-set unavailable, using profile as-is", e)
++            return rawContent
++        }
++        val injected = GeoIPProfileInjector.inject(rawContent, ruleSetFile.absolutePath)
++        Log.i(
++            TAG,
++            "geoip inject: local=${ruleSetFile.absolutePath} " +
++                "size=${ruleSetFile.length()} in=${rawContent.length} out=${injected.length} " +
++                "changed=${injected !== rawContent}",
++        )
++        return injected
++    }
++
+     private suspend fun startService() {
+         try {
+             withContext(Dispatchers.Main) {
+@@ -136,11 +208,12 @@ class BoxService(private val service: Service, private val platformInterface: Pl
+                 return
+             }
+ 
+-            val content = File(profile.typed.path).readText()
+-            if (content.isBlank()) {
++            val rawContent = File(profile.typed.path).readText()
++            if (rawContent.isBlank()) {
+                 stopAndAlert(Alert.EmptyConfiguration)
+                 return
+             }
++            val content = prepareContent(rawContent)
+ 
+             lastProfileName = profile.name
+             withContext(Dispatchers.Main) {
+@@ -154,6 +227,7 @@ class BoxService(private val service: Service, private val platformInterface: Pl
+                     content,
+                     OverrideOptions().apply {
+                         autoRedirect = Settings.autoRedirect
++                        // selfExcludeGuard: the app must always exclude itself, see the note below.
+                         if (Vendor.isPerAppProxyAvailable() && Settings.perAppProxyEnabled) {
+                             val appList = Settings.getEffectivePerAppProxyList()
+                             if (Settings.getEffectivePerAppProxyMode() == Settings.PER_APP_PROXY_INCLUDE) {
+@@ -163,6 +237,10 @@ class BoxService(private val service: Service, private val platformInterface: Pl
+                                 excludePackage =
+                                     PlatformInterfaceWrapper.StringArray((appList - Application.application.packageName).iterator())
+                             }
++                        } else {
++                            excludePackage = PlatformInterfaceWrapper.StringArray(
++                                listOf(Application.application.packageName).iterator(),
++                            )
+                         }
+                     },
+                 )
+@@ -189,6 +267,7 @@ class BoxService(private val service: Service, private val platformInterface: Pl
+                 notification.show(lastProfileName, R.string.status_started)
+             }
+             notification.start()
++            scheduleRuleSetUpdate()
+         } catch (e: Exception) {
+             stopAndAlert(Alert.StartService, e.message)
+             return
+@@ -213,6 +292,20 @@ class BoxService(private val service: Service, private val platformInterface: Pl
+     }
+ 
+     suspend fun serviceReload0() {
++        // A config containing a tun inbound cannot be hot-reloaded in place:
++        // startOrReloadService() tears down the old core and asks the platform
++        // for a new tunnel via OpenTun, which overwrites `fileDescriptor`
++        // without closing the previous one. The orphaned fd keeps its read loop
++        // draining the interface while its outbounds are already gone, so every
++        // connection is RST or times out and the new tunnel never sees traffic.
++        // Close the old tunnel first, exactly like serviceStop()/stopService().
++        val staleTun = fileDescriptor
++        if (staleTun != null) {
++            runCatching { staleTun.close() }
++                .onFailure { commandServer.setError("android: close stale tun: ${it.message}") }
++            fileDescriptor = null
++        }
++
+         val selectedProfileId = Settings.selectedProfile
+         if (selectedProfileId == -1L) {
+             stopAndAlert(Alert.EmptyConfiguration)
+@@ -225,17 +318,19 @@ class BoxService(private val service: Service, private val platformInterface: Pl
+             return
+         }
+ 
+-        val content = File(profile.typed.path).readText()
+-        if (content.isBlank()) {
++        val rawContent = File(profile.typed.path).readText()
++        if (rawContent.isBlank()) {
+             stopAndAlert(Alert.EmptyConfiguration)
+             return
+         }
++        val content = prepareContent(rawContent)
+         lastProfileName = profile.name
+         try {
+             commandServer.startOrReloadService(
+                 content,
+                 OverrideOptions().apply {
+                     autoRedirect = Settings.autoRedirect
++                    // selfExcludeGuard: the app must always exclude itself, see the note below.
+                     if (Vendor.isPerAppProxyAvailable() && Settings.perAppProxyEnabled) {
+                         val appList = Settings.getEffectivePerAppProxyList()
+                         if (Settings.getEffectivePerAppProxyMode() == Settings.PER_APP_PROXY_INCLUDE) {
+@@ -243,6 +338,10 @@ class BoxService(private val service: Service, private val platformInterface: Pl
+                         } else {
+                             excludePackage = PlatformInterfaceWrapper.StringArray((appList - Application.application.packageName).iterator())
+                         }
++                    } else {
++                        excludePackage = PlatformInterfaceWrapper.StringArray(
++                            listOf(Application.application.packageName).iterator(),
++                        )
+                     }
+                 },
+             )
+diff --git a/app/src/main/java/io/nekohasekai/sfa/compose/navigation/Navigation.kt b/app/src/main/java/io/nekohasekai/sfa/compose/navigation/Navigation.kt
+index 8ab1513..2a9a8b3 100644
+--- a/app/src/main/java/io/nekohasekai/sfa/compose/navigation/Navigation.kt
++++ b/app/src/main/java/io/nekohasekai/sfa/compose/navigation/Navigation.kt
+@@ -34,6 +34,7 @@ import io.nekohasekai.sfa.compose.screen.settings.PrivilegeSettingsScreen
+ import io.nekohasekai.sfa.compose.screen.settings.ProfileOverrideScreen
+ import io.nekohasekai.sfa.compose.screen.settings.RemoteControlScreen
+ import io.nekohasekai.sfa.compose.screen.settings.ServiceSettingsScreen
++import io.nekohasekai.sfa.compose.screen.settings.GeoIPSettingsScreen
+ import io.nekohasekai.sfa.compose.screen.settings.SettingsScreen
+ import io.nekohasekai.sfa.compose.screen.settings.TailscaleFontPickerScreen
+ import io.nekohasekai.sfa.compose.screen.settings.TailscaleGhosttyConfigEditorScreen
+@@ -651,6 +652,16 @@ fun NavHost(
+             ServiceSettingsScreen(navController = navController, serviceStatus = serviceStatus)
+         }
+ 
++        composable(
++            route = "settings/geoip",
++            enterTransition = slideInFromRight,
++            exitTransition = slideOutToLeft,
++            popEnterTransition = slideInFromLeft,
++            popExitTransition = slideOutToRight,
++        ) {
++            GeoIPSettingsScreen(navController = navController)
++        }
++
+         composable(
+             route = "settings/profile_override",
+             enterTransition = slideInFromRight,
+diff --git a/app/src/main/java/io/nekohasekai/sfa/compose/screen/configuration/NewProfileScreen.kt b/app/src/main/java/io/nekohasekai/sfa/compose/screen/configuration/NewProfileScreen.kt
+index e4e50f7..ec3fa5d 100644
+--- a/app/src/main/java/io/nekohasekai/sfa/compose/screen/configuration/NewProfileScreen.kt
++++ b/app/src/main/java/io/nekohasekai/sfa/compose/screen/configuration/NewProfileScreen.kt
+@@ -67,6 +67,23 @@ import io.nekohasekai.sfa.compose.base.SelectableMessageDialog
+ import io.nekohasekai.sfa.compose.topbar.LocalScaffoldPadding
+ import io.nekohasekai.sfa.compose.topbar.OverrideTopBar
+ 
++// MIME filter for the system picker when importing a profile.
++//
++// This must stay the catch-all wildcard. Measured on MIUI with Android 14,
++// opening the picker for the same folder gives:
++//
++//     application/json          -> "no files"
++//     application/octet-stream  -> "no files"
++//     text/plain                -> the .json files appear
++//     catch-all                 -> the .json files appear
++//
++// The reason is that this ROM's MediaStore indexes .json as text/plain, so a
++// filter of application/json hides every profile the user wants to import.
++// Narrowing the filter would silently empty the picker again.
++private val IMPORT_MIME_TYPES = arrayOf(
++    "*/*",
++)
++
+ @OptIn(ExperimentalMaterial3Api::class)
+ @Composable
+ fun NewProfileScreen(
+@@ -89,9 +106,17 @@ fun NewProfileScreen(
+     }
+ 
+     // File picker launcher
++    //
++    // The MIME type must be explicit. `ActivityResultContracts.GetContent()`
++    // with no argument sends `*/*`, and MIUI's DocumentsUI renders `*/*` as
++    // "no files" inside Download - the picker shows an empty list even though
++    // the files are readable by the documents provider itself. Passing a
++    // concrete type makes the list appear; `application/octet-stream` and
++    // `text/plain` are added because a profile saved from a browser or a
++    // messaging app often arrives with a generic or text type.
+     val filePickerLauncher =
+         rememberLauncherForActivityResult(
+-            contract = ActivityResultContracts.GetContent(),
++            contract = ActivityResultContracts.OpenDocument(),
+         ) { uri: Uri? ->
+             uri?.let {
+                 val fileName =
+@@ -400,7 +425,7 @@ fun NewProfileScreen(
+                                 verticalArrangement = Arrangement.spacedBy(4.dp),
+                             ) {
+                                 OutlinedCard(
+-                                    onClick = { filePickerLauncher.launch("*/*") },
++                                    onClick = { filePickerLauncher.launch(IMPORT_MIME_TYPES) },
+                                     modifier = Modifier.fillMaxWidth(),
+                                     border =
+                                     BorderStroke(
+diff --git a/app/src/main/java/io/nekohasekai/sfa/compose/screen/dashboard/DashboardViewModel.kt b/app/src/main/java/io/nekohasekai/sfa/compose/screen/dashboard/DashboardViewModel.kt
+index 5ce325e..8f26b8c 100644
+--- a/app/src/main/java/io/nekohasekai/sfa/compose/screen/dashboard/DashboardViewModel.kt
++++ b/app/src/main/java/io/nekohasekai/sfa/compose/screen/dashboard/DashboardViewModel.kt
+@@ -280,7 +280,14 @@ class DashboardViewModel :
+ 
+                 // Check if service is running
+                 if (_serviceStatus.value == Status.Started) {
+-                    val restart = Settings.rebuildServiceMode()
++                    // A profile with a tun inbound cannot be hot-reloaded: the
++                    // core asks the platform for a fresh tunnel while the old
++                    // one is still open. Always do a full stop/start in that
++                    // case instead of relying on a service-mode change alone.
++                    var restart = Settings.rebuildServiceMode()
++                    if (!restart) {
++                        restart = runCatching { Settings.needVPNService() }.getOrDefault(false)
++                    }
+                     if (restart) {
+                         // Need full restart
+                         BoxService.stop()
+diff --git a/app/src/main/java/io/nekohasekai/sfa/compose/screen/settings/SettingsScreen.kt b/app/src/main/java/io/nekohasekai/sfa/compose/screen/settings/SettingsScreen.kt
+index e480f9d..e373b2b 100644
+--- a/app/src/main/java/io/nekohasekai/sfa/compose/screen/settings/SettingsScreen.kt
++++ b/app/src/main/java/io/nekohasekai/sfa/compose/screen/settings/SettingsScreen.kt
+@@ -19,6 +19,7 @@ import androidx.compose.material.icons.outlined.Description
+ import androidx.compose.material.icons.outlined.Favorite
+ import androidx.compose.material.icons.outlined.FilterAlt
+ import androidx.compose.material.icons.outlined.Info
++import androidx.compose.material.icons.outlined.Public
+ import androidx.compose.material.icons.outlined.Settings
+ import androidx.compose.material.icons.outlined.SettingsRemote
+ import androidx.compose.material.icons.outlined.Tune
+@@ -169,6 +170,27 @@ fun SettingsScreen(navController: NavController) {
+                     ),
+                 )
+ 
++                ListItem(
++                    headlineContent = {
++                        Text(
++                            "China IP rule-set",
++                            style = MaterialTheme.typography.bodyLarge,
++                        )
++                    },
++                    leadingContent = {
++                        Icon(
++                            imageVector = Icons.Outlined.Public,
++                            contentDescription = null,
++                            tint = MaterialTheme.colorScheme.primary,
++                        )
++                    },
++                    modifier = Modifier.clickable { navController.navigate("settings/geoip") },
++                    colors =
++                    ListItemDefaults.colors(
++                        containerColor = Color.Transparent,
++                    ),
++                )
++
+                 ListItem(
+                     headlineContent = {
+                         Text(
+diff --git a/app/src/main/java/io/nekohasekai/sfa/constant/Path.kt b/app/src/main/java/io/nekohasekai/sfa/constant/Path.kt
+index e9d07a8..737ca0f 100644
+--- a/app/src/main/java/io/nekohasekai/sfa/constant/Path.kt
++++ b/app/src/main/java/io/nekohasekai/sfa/constant/Path.kt
+@@ -3,4 +3,7 @@ package io.nekohasekai.sfa.constant
+ object Path {
+     const val SETTINGS_DATABASE_PATH = "settings.db"
+     const val PROFILES_DATABASE_PATH = "profiles.db"
++    const val GEOIP_RULESET_DIR = "rules"
++    const val GEOIP_RULESET_FILE = "geoip-cn.srs"
++    const val GEOIP_RULESET_ASSET = "geoip-cn.srs"
+ }
+diff --git a/app/src/main/java/io/nekohasekai/sfa/constant/SettingsKey.kt b/app/src/main/java/io/nekohasekai/sfa/constant/SettingsKey.kt
+index 836d0e5..4cb2100 100644
+--- a/app/src/main/java/io/nekohasekai/sfa/constant/SettingsKey.kt
++++ b/app/src/main/java/io/nekohasekai/sfa/constant/SettingsKey.kt
+@@ -60,6 +60,13 @@ object SettingsKey {
+     const val TAILSCALE_SSH_DARK_CONFIG = "tailscale_ssh_dark_config"
+     const val TAILSCALE_SSH_FONT_FOLLOW_THEME = "tailscale_ssh_font_follow_theme"
+ 
++    // geoip rule-set
++    const val GEOIP_AUTO_UPDATE_ENABLED = "geoip_auto_update_enabled"
++    const val GEOIP_UPDATE_INTERVAL_HOURS = "geoip_update_interval_hours"
++    const val GEOIP_LAST_UPDATE = "geoip_last_update"
++    const val GEOIP_LAST_VERSION = "geoip_last_version"
++    const val GEOIP_LAST_ERROR = "geoip_last_error"
++
+     // cache
+     const val STARTED_BY_USER = "started_by_user"
+     const val CACHED_UPDATE_INFO = "cached_update_info"
+diff --git a/app/src/main/java/io/nekohasekai/sfa/database/Settings.kt b/app/src/main/java/io/nekohasekai/sfa/database/Settings.kt
+index 0fd720c..57b6308 100644
+--- a/app/src/main/java/io/nekohasekai/sfa/database/Settings.kt
++++ b/app/src/main/java/io/nekohasekai/sfa/database/Settings.kt
+@@ -57,6 +57,13 @@ object Settings {
+     }
+     var githubToken by dataStore.string(SettingsKey.GITHUB_TOKEN) { "" }
+     var silentInstallEnabled by dataStore.boolean(SettingsKey.SILENT_INSTALL_ENABLED) { false }
++
++    // geoip rule-set
++    var geoipAutoUpdateEnabled by dataStore.boolean(SettingsKey.GEOIP_AUTO_UPDATE_ENABLED) { true }
++    var geoipUpdateIntervalHours by dataStore.int(SettingsKey.GEOIP_UPDATE_INTERVAL_HOURS) { 72 }
++    var geoipLastUpdate by dataStore.long(SettingsKey.GEOIP_LAST_UPDATE) { 0L }
++    var geoipLastVersion by dataStore.string(SettingsKey.GEOIP_LAST_VERSION) { "" }
++    var geoipLastError by dataStore.string(SettingsKey.GEOIP_LAST_ERROR) { "" }
+     var silentInstallMethod by dataStore.string(SettingsKey.SILENT_INSTALL_METHOD) {
+         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+             "PACKAGE_INSTALLER"
+@@ -155,7 +162,7 @@ object Settings {
+         return true
+     }
+ 
+-    private suspend fun needVPNService(): Boolean {
++    suspend fun needVPNService(): Boolean {
+         val selectedProfileId = selectedProfile
+         if (selectedProfileId == -1L) return false
+         val profile = ProfileManager.get(selectedProfileId) ?: return false
+diff --git a/gradle.properties b/gradle.properties
+index e091da2..09e4a4d 100644
+--- a/gradle.properties
++++ b/gradle.properties
+@@ -6,7 +6,7 @@
+ # http://www.gradle.org/docs/current/userguide/build_environment.html
+ # Specifies the JVM arguments used for the daemon process.
+ # The setting is particularly useful for tweaking memory settings.
+-org.gradle.jvmargs=-Xmx8192m -Dfile.encoding=UTF-8
++org.gradle.jvmargs=-Xmx3g -XX:MaxMetaspaceSize=768m -Dfile.encoding=UTF-8
+ # When configured, Gradle will run in incubating parallel mode.
+ # This option should only be used with decoupled projects. More details, visit
+ # http://www.gradle.org/docs/current/userguide/multi_project_builds.html#sec:decoupled_projects
