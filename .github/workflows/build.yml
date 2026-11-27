@@ -80,8 +80,12 @@ jobs:
         run: gomobile init
 
       - name: Build libbox
-        working-directory: sing-box
-        run: go run ./cmd/internal/build_libbox -target android
+        run: |
+          # Not `go run ./cmd/internal/build_libbox`: that enables
+          # with_naive_outbound, whose cronet static libs fail to link with
+          # the runner's lld. See scripts/build-libbox.sh for the details.
+          cd sing-box
+          bash "$GITHUB_WORKSPACE/scripts/build-libbox.sh" "$SING_BOX_REF"
 
       - name: Show artefacts
         run: |
