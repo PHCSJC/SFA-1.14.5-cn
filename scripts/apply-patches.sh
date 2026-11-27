@@ -45,5 +45,8 @@ echo "==> copying overlay from $OVERLAY_DIR"
   echo "    $rel"
 done
 
+echo "==> adapting to libbox 1.14.5 API"
+python3 "$REPO_DIR/scripts/adapt-libbox-1.14.5.py" "$SFA_DIR"
+
 echo "==> done"
 git -C "$SFA_DIR" status --short
